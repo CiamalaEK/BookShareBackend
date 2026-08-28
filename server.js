@@ -534,8 +534,34 @@ app.post('/api/requests', authenticate, async (req, res) => {
       [bookId, safeRequesterId, safeOwnerId, requestType || 'lend', 'pending']
     );
 
+    const [existingHold] = await pool.query(
+      'SELECT * FROM holds WHERE book_id = ? AND user_id = ? AND status IN ("queued", "fulfilled")',
+      [bookId, safeRequesterId]
+    );
+
+    if (!existingHold.length) {
+      const [queuedRows] = await pool.query(
+        'SELECT * FROM holds WHERE book_id = ? AND status = "queued" ORDER BY created_at ASC, id ASC',
+        [bookId]
+      );
+      const queuePosition = queuedRows.length + 1;
+
+      await pool.query(
+        'INSERT INTO holds (book_id, user_id, status, queue_position) VALUES (?, ?, "queued", ?)',
+        [bookId, safeRequesterId, queuePosition]
+      );
+    }
+
     const [rows] = await pool.query('SELECT * FROM requests WHERE id = ?', [result.insertId]);
-    res.status(201).json(rows[0]);
+    const [holdRows] = await pool.query(
+      'SELECT * FROM holds WHERE book_id = ? AND user_id = ? AND status = "queued" ORDER BY created_at ASC, id ASC LIMIT 1',
+      [bookId, safeRequesterId]
+    );
+
+    res.status(201).json({
+      ...rows[0],
+      queue_position: holdRows[0]?.queue_position || 1
+    });
   } catch (error) {
     res.status(500).json({ message: 'Request creation failed', error: error.message });
   }
