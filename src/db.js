@@ -6,7 +6,7 @@ const pool = mysql.createPool({
   host: process.env.DB_HOST || 'mainline.proxy.rlwy.net',
   port: Number(process.env.DB_PORT || 16263),
   user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || 'ghGDyDIVYNRoEuLMVhuZtrwvkdqgYvKw',
+  password: process.env.DB_PASSWORD ?? 'ghGDyDIVYNRoEuLMVhuZtrwvkdqgYvKw',
   database: process.env.DB_NAME || 'railway',
   waitForConnections: true,
   connectionLimit: 10,
@@ -16,7 +16,7 @@ const pool = mysql.createPool({
 
 let dbReady = false;
 
-async function ensureSchemaColumns() {
+async function  ensureSchemaColumns() {
   const [userColumns] = await pool.query('SHOW COLUMNS FROM users');
   const userFields = userColumns.map((column) => column.Field);
 
@@ -84,6 +84,9 @@ async function seedDatabase() {
       'INSERT INTO users (name, email, password_hash, city) VALUES ?', [seedUsers]
     );
 
+    // Ensure the seeded admin user has role 'admin'
+    await pool.query("UPDATE users SET role = 'admin' WHERE email = 'admin@bookshare.com'");
+
     const userIds = Array.from({ length: userResults.affectedRows }, (_, index) => index + 1);
     const bookRows = [
       ['The Midnight Library', 'Matt Haig', '978-0-525-55932-2', 'Fiction', 'English', 'Good', 'lend', 'available', userIds[0], 'Bengaluru', 'https://images.unsplash.com/photo-1512820790803-83ca734da794?auto=format&fit=crop&w=800&q=80', 14],
@@ -107,6 +110,23 @@ async function seedDatabase() {
        VALUES
        (1, 'Neha requested to borrow Clean Code', 'request', false),
        (1, 'Your return reminder for The Midnight Library is due soon', 'reminder', false)`
+    );
+
+    await pool.query(
+      `INSERT INTO shelves (user_id, name, description)
+       VALUES
+       (1, 'My Book Recommendations of the Month', 'Monthly picks'),
+       (1, 'Books You Can Read in One Sitting', 'Short reads'),
+       (1, 'Long Books to Get Lost In', 'Long form fiction')`
+    );
+
+    await pool.query(
+      `INSERT IGNORE INTO shelf_books (shelf_id, book_id) VALUES
+       (1, 1), (1, 3), (2, 2), (3, 4)`
+    );
+    await pool.query(
+      `INSERT IGNORE INTO wishlist_items (user_id, book_id) VALUES
+       (1, 2), (1, 4)`
     );
   } catch (error) {
     console.warn('Seed data insertion skipped:', error.message);
@@ -190,11 +210,36 @@ async function initializeDatabase() {
         FOREIGN KEY (book_id) REFERENCES books(id),
         FOREIGN KEY (user_id) REFERENCES users(id)
       );
-    `);
 
+      CREATE TABLE IF NOT EXISTS shelves (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        name VARCHAR(180) NOT NULL,
+        description VARCHAR(255) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS shelf_books (
+        shelf_id INT NOT NULL,
+        book_id INT NOT NULL,
+        PRIMARY KEY (shelf_id, book_id),
+        FOREIGN KEY (shelf_id) REFERENCES shelves(id) ON DELETE CASCADE,
+        FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS wishlist_items (
+        user_id INT NOT NULL,
+        book_id INT NOT NULL,
+        PRIMARY KEY (user_id, book_id),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+      );
+    `);
+      console.log('Database schema ensured successfully.');
     await ensureSchemaColumns();
     await seedDatabase();
-
+ console.log('12321 Database schema ensured successfully.');
     dbReady = true;
     console.log('MySQL database initialized successfully.');
     return true;

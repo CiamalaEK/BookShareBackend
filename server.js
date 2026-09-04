@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
 const { pool, initializeDatabase, isDbReady } = require('./src/db');
+const { demoUsers, demoBooks, demoRequests, demoNotifications } = require('./src/data');
 
 dotenv.config();
 
@@ -77,11 +78,19 @@ const requireDatabase = (res) => {
 };
 
 const readUsers = async () => {
+  if (!isDbReady()) {
+    return demoUsers.map((user) => ({ ...user, password_hash: undefined }));
+  }
+
   const [rows] = await pool.query('SELECT * FROM users');
   return rows.map((user) => ({ ...user, password_hash: undefined }));
 };
 
 const readBooks = async () => {
+  if (!isDbReady()) {
+    return demoBooks;
+  }
+
   const [rows] = await pool.query(`
     SELECT b.*, u.name AS owner_name
     FROM books b
@@ -91,6 +100,10 @@ const readBooks = async () => {
 };
 
 const readRequests = async () => {
+  if (!isDbReady()) {
+    return demoRequests;
+  }
+
   const [rows] = await pool.query(`
     SELECT r.*, b.title AS book_title, u1.name AS requester_name, u2.name AS owner_name
     FROM requests r
@@ -102,11 +115,19 @@ const readRequests = async () => {
 };
 
 const readNotifications = async () => {
+  if (!isDbReady()) {
+    return demoNotifications;
+  }
+
   const [rows] = await pool.query('SELECT * FROM notifications ORDER BY created_at DESC');
   return rows;
 };
 
 const readHolds = async () => {
+  if (!isDbReady()) {
+    return [];
+  }
+
   const [rows] = await pool.query(`
     SELECT h.*, b.title AS book_title, u.name AS user_name
     FROM holds h
@@ -266,21 +287,13 @@ app.get('/api/users', authenticate, async (req, res) => {
 });
 
 app.get('/api/books', async (req, res) => {
-  if (!isDbReady()) {
-    return requireDatabase(res);
-  }
-
   const books = await readBooks();
   res.json(books);
 });
 
 app.get('/api/books/:id', async (req, res) => {
-  if (!isDbReady()) {
-    return requireDatabase(res);
-  }
-
   const books = await readBooks();
-  const book = books.find((item) => item.id === Number(req.params.id));
+  const book = books.find((item) => Number(item.id) === Number(req.params.id));
 
   if (!book) {
     return res.status(404).json({ message: 'Book not found' });
@@ -290,28 +303,21 @@ app.get('/api/books/:id', async (req, res) => {
 });
 
 app.get('/api/requests', async (req, res) => {
-  if (!isDbReady()) {
-    return requireDatabase(res);
-  }
-
   const requests = await readRequests();
   res.json(requests);
 });
 
 app.get('/api/notifications', authenticate, async (req, res) => {
-  if (!isDbReady()) {
-    return requireDatabase(res);
-  }
-
   const notifications = await readNotifications();
+  // filter to the authenticated user if possible
+  if (Array.isArray(notifications) && notifications.length && notifications[0].userId !== undefined) {
+    const filtered = notifications.filter((n) => Number(n.userId ?? n.user_id) === Number(req.user.id));
+    return res.json(filtered);
+  }
   res.json(notifications);
 });
 
 app.get('/api/holds', authenticate, async (req, res) => {
-  if (!isDbReady()) {
-    return requireDatabase(res);
-  }
-
   const holds = await readHolds();
   res.json(holds);
 });
@@ -417,17 +423,262 @@ app.post('/api/holds/:id/fulfill', authenticate, async (req, res) => {
 });
 
 app.get('/api/alerts', authenticate, async (req, res) => {
-  if (!isDbReady()) {
-    return requireDatabase(res);
-  }
-
   try {
     const baseAlerts = await readNotifications();
-    const dynamicAlerts = await buildDueDateAlerts(req.user.id);
-    const filteredBase = baseAlerts.filter((item) => Number(item.user_id) === Number(req.user.id));
+    const dynamicAlerts = isDbReady() ? await buildDueDateAlerts(req.user.id) : [];
+    const filteredBase = Array.isArray(baseAlerts) ? baseAlerts.filter((item) => Number(item.userId ?? item.user_id) === Number(req.user.id)) : [];
     res.json([...filteredBase, ...dynamicAlerts]);
   } catch (error) {
     res.status(500).json({ message: 'Alerts generation failed', error: error.message });
+  }
+});
+
+// Admin data export: returns all core datasets for admin users
+app.get('/api/admin/data', authenticate, async (req, res) => {
+  if (!isDbReady()) return requireDatabase(res);
+
+  try {
+    // Verify role from database
+    const [urows] = await pool.query('SELECT role FROM users WHERE id = ?', [req.user.id]);
+    const role = urows[0]?.role || 'member';
+    if (role !== 'admin') return res.status(403).json({ message: 'Forbidden: admin only' });
+
+    const [users] = await pool.query('SELECT id, name, email, city, library_membership_number, phone_number, role, created_at FROM users ORDER BY id ASC');
+    const [books] = await pool.query('SELECT b.*, u.name AS owner_name FROM books b JOIN users u ON u.id = b.owner_id ORDER BY b.id ASC');
+    const [requests] = await pool.query('SELECT r.*, b.title AS book_title, u1.name AS requester_name, u2.name AS owner_name FROM requests r JOIN books b ON b.id = r.book_id JOIN users u1 ON u1.id = r.requester_id JOIN users u2 ON u2.id = r.owner_id ORDER BY r.id ASC');
+    const [holds] = await pool.query('SELECT h.*, b.title AS book_title, u.name AS user_name FROM holds h JOIN books b ON b.id = h.book_id JOIN users u ON u.id = h.user_id ORDER BY h.id ASC');
+    const [shelves] = await pool.query('SELECT * FROM shelves ORDER BY id ASC');
+    // attach shelf books
+    for (const shelf of shelves) {
+      const [sbooks] = await pool.query('SELECT b.* FROM books b JOIN shelf_books sb ON sb.book_id = b.id WHERE sb.shelf_id = ?', [shelf.id]);
+      shelf.books = sbooks;
+    }
+    const [notifications] = await pool.query('SELECT * FROM notifications ORDER BY id DESC');
+    const [wishlist_items] = await pool.query('SELECT * FROM wishlist_items ORDER BY user_id ASC');
+
+    res.json({ users, books, requests, holds, shelves, notifications, wishlist_items });
+  } catch (error) {
+    res.status(500).json({ message: 'Admin export failed', error: error.message });
+  }
+});
+
+// Shelves endpoints: create, list, get, and add/remove books
+app.get('/api/shelves', authenticate, async (req, res) => {
+  if (!isDbReady()) {
+    // DB not available — return empty shelves list to avoid 503 for read-only calls
+    return res.json([]);
+  }
+
+  try {
+    const userId = Number(req.user.id);
+    const [shelves] = await pool.query('SELECT * FROM shelves WHERE user_id = ? ORDER BY created_at DESC', [userId]);
+
+    const result = [];
+    for (const shelf of shelves) {
+      const [books] = await pool.query(
+        `SELECT b.* FROM books b JOIN shelf_books sb ON sb.book_id = b.id WHERE sb.shelf_id = ?`,
+        [shelf.id]
+      );
+      result.push({ ...shelf, books });
+    }
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ message: 'Unable to load shelves', error: error.message });
+  }
+});
+
+app.get('/api/shelves/:id', authenticate, async (req, res) => {
+  if (!isDbReady()) {
+    // DB not available — return not found (no shelves in demo mode)
+    return res.status(404).json({ message: 'Shelf not found' });
+  }
+
+  try {
+    const [rows] = await pool.query('SELECT * FROM shelves WHERE id = ?', [req.params.id]);
+    const shelf = rows[0];
+    if (!shelf) return res.status(404).json({ message: 'Shelf not found' });
+    if (Number(shelf.user_id) !== Number(req.user.id)) return res.status(403).json({ message: 'Forbidden' });
+
+    const [books] = await pool.query('SELECT b.* FROM books b JOIN shelf_books sb ON sb.book_id = b.id WHERE sb.shelf_id = ?', [shelf.id]);
+    res.json({ ...shelf, books });
+  } catch (error) {
+    res.status(500).json({ message: 'Unable to load shelf', error: error.message });
+  }
+});
+
+app.post('/api/shelves', authenticate, async (req, res) => {
+  console.log('Creating shelf with request body:', req.body);
+  if (!isDbReady()) return requireDatabase(res);
+
+  const { name, description, bookIds } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ message: 'Shelf name is required' });
+
+  try {
+    const [result] = await pool.query('INSERT INTO shelves (user_id, name, description) VALUES (?, ?, ?)', [req.user.id, name.trim(), description || null]);
+    const shelfId = result.insertId;
+
+    if (Array.isArray(bookIds) && bookIds.length) {
+      const values = bookIds.map((bid) => [shelfId, Number(bid)]);
+      await pool.query('INSERT IGNORE INTO shelf_books (shelf_id, book_id) VALUES ?', [values]);
+    }
+
+    const [rows] = await pool.query('SELECT * FROM shelves WHERE id = ?', [shelfId]);
+    const shelf = rows[0];
+    const [books] = await pool.query('SELECT b.* FROM books b JOIN shelf_books sb ON sb.book_id = b.id WHERE sb.shelf_id = ?', [shelfId]);
+    res.status(201).json({ ...shelf, books });
+  } catch (error) {
+    res.status(500).json({ message: 'Unable to create shelf', error: error.message });
+  }
+});
+
+app.post('/api/shelves/:id/books', authenticate, async (req, res) => {
+  if (!isDbReady()) return requireDatabase(res);
+
+  const shelfId = Number(req.params.id);
+  const { bookId, add } = req.body;
+
+  if (!shelfId || !bookId) return res.status(400).json({ message: 'Shelf ID and book ID required' });
+
+  try {
+    const [rows] = await pool.query('SELECT * FROM shelves WHERE id = ?', [shelfId]);
+    const shelf = rows[0];
+    if (!shelf) return res.status(404).json({ message: 'Shelf not found' });
+    if (Number(shelf.user_id) !== Number(req.user.id)) return res.status(403).json({ message: 'Forbidden' });
+
+    if (add) {
+      await pool.query('INSERT IGNORE INTO shelf_books (shelf_id, book_id) VALUES (?, ?)', [shelfId, Number(bookId)]);
+    } else {
+      await pool.query('DELETE FROM shelf_books WHERE shelf_id = ? AND book_id = ?', [shelfId, Number(bookId)]);
+    }
+
+    const [books] = await pool.query('SELECT b.* FROM books b JOIN shelf_books sb ON sb.book_id = b.id WHERE sb.shelf_id = ?', [shelfId]);
+    res.json({ ...shelf, books });
+  } catch (error) {
+    res.status(500).json({ message: 'Unable to update shelf books', error: error.message });
+  }
+});
+
+// Server-side advanced search endpoint
+app.get('/api/search', async (req, res) => {
+  if (!isDbReady()) {
+    // return demo filtered results when DB not ready
+    const demo = demoBooks || [];
+    // very small server-side-like filtering for demo mode
+    const q = (req.query.q || '').toLowerCase();
+    const filtered = demo.filter((b) => {
+      if (!q) return true;
+      return (`${b.title} ${b.author} ${b.isbn || ''} ${b.category || ''}`).toLowerCase().includes(q);
+    });
+    res.setHeader('X-Total-Count', String(filtered.length));
+    return res.json(filtered);
+  }
+
+  try {
+    const {
+      q = '', title = '', author = '', isbn = '', category = '', publisher = '', language = '', genre = '', tags = '', member = '', availability = '', filter = '', limit = 50, offset = 0
+    } = req.query;
+
+    const where = [];
+    const params = [];
+
+    if (q) {
+      where.push('(b.title LIKE ? OR b.author LIKE ? OR b.isbn LIKE ? OR b.category LIKE ? OR u.name LIKE ?)');
+      const like = `%${q}%`;
+      params.push(like, like, like, like, like);
+    }
+    if (title) { where.push('b.title LIKE ?'); params.push(`%${title}%`); }
+    if (author) { where.push('b.author LIKE ?'); params.push(`%${author}%`); }
+    if (isbn) { where.push('b.isbn LIKE ?'); params.push(`%${isbn}%`); }
+    if (category) { where.push('b.category LIKE ?'); params.push(`%${category}%`); }
+    if (publisher) { where.push('b.publisher LIKE ?'); params.push(`%${publisher}%`); }
+    if (language) { where.push('b.language LIKE ?'); params.push(`%${language}%`); }
+    if (genre) { where.push('(b.genre LIKE ? OR b.category LIKE ?)'); params.push(`%${genre}%`, `%${genre}%`); }
+    if (tags) { where.push('b.tags LIKE ?'); params.push(`%${tags}%`); }
+    if (member) { where.push('u.name LIKE ?'); params.push(`%${member}%`); }
+    if (availability) {
+      if (availability === 'available') where.push("b.status = 'available'");
+      if (availability === 'issued') where.push("b.status <> 'available'");
+    }
+
+    // base select with popularity subqueries
+    let sql = `SELECT b.*, u.name AS owner_name,
+      (SELECT COUNT(*) FROM requests r WHERE r.book_id = b.id) AS request_count,
+      (SELECT COUNT(*) FROM holds h WHERE h.book_id = b.id) AS hold_count
+      FROM books b
+      JOIN users u ON u.id = b.owner_id`;
+
+    if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
+
+    // sorting
+    if (filter === 'most_borrowed') {
+      sql += ' ORDER BY request_count DESC';
+    } else if (filter === 'most_popular') {
+      sql += ' ORDER BY (request_count + hold_count) DESC';
+    } else if (filter === 'recent') {
+      sql += ' ORDER BY b.created_at DESC';
+    } else if (filter === 'new') {
+      // keep default ordering but limit will naturally show new ones
+      sql += ' ORDER BY b.created_at DESC';
+    } else {
+      sql += ' ORDER BY b.title ASC';
+    }
+
+    // prepare count query (same WHERE but without subselects/ordering/limit)
+    const paramsForCount = params.slice();
+
+    sql += ' LIMIT ? OFFSET ?';
+    params.push(Number(limit) || 50, Number(offset) || 0);
+
+    const [rows] = await pool.query(sql, params);
+
+    // build count SQL
+    let countSql = `SELECT COUNT(*) AS total FROM books b JOIN users u ON u.id = b.owner_id`;
+    if (where.length) countSql += ` WHERE ${where.join(' AND ')}`;
+    const [countRows] = await pool.query(countSql, paramsForCount);
+    const total = Number((countRows[0] && countRows[0].total) || 0);
+    res.setHeader('X-Total-Count', String(total));
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ message: 'Search failed', error: error.message });
+  }
+});
+
+// Wishlist endpoints: list and add/remove items
+app.get('/api/wishlist', authenticate, async (req, res) => {
+  if (!isDbReady()) return res.json([]);
+  try {
+    const userId = Number(req.user.id);
+    const [rows] = await pool.query(
+      `SELECT b.* FROM books b JOIN wishlist_items w ON w.book_id = b.id WHERE w.user_id = ? ORDER BY b.title ASC`,
+      [userId]
+    );
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ message: 'Unable to load wishlist', error: error.message });
+  }
+});
+
+app.post('/api/wishlist', authenticate, async (req, res) => {
+  if (!isDbReady()) return requireDatabase(res);
+  const { bookId, add } = req.body;
+  const userId = Number(req.user.id);
+  if (!bookId) return res.status(400).json({ message: 'Book ID required' });
+
+  try {
+    const [bookRows] = await pool.query('SELECT id FROM books WHERE id = ?', [Number(bookId)]);
+    if (!bookRows.length) return res.status(404).json({ message: 'Book not found' });
+
+    if (add) {
+      await pool.query('INSERT IGNORE INTO wishlist_items (user_id, book_id) VALUES (?, ?)', [userId, Number(bookId)]);
+    } else {
+      await pool.query('DELETE FROM wishlist_items WHERE user_id = ? AND book_id = ?', [userId, Number(bookId)]);
+    }
+
+    const [rows] = await pool.query('SELECT b.* FROM books b JOIN wishlist_items w ON w.book_id = b.id WHERE w.user_id = ?', [userId]);
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ message: 'Unable to update wishlist', error: error.message });
   }
 });
 
